@@ -22,5 +22,11 @@ filter relaxes in stages so the bot still trades broadly.
 
 The same design scored **+0.476 SOL net** on the sibling 12-hour sprint over
 this kit's 1,222-coin dev window (105 round trips, 47% win rate, max
-drawdown 2.0%, guardrails met; stress test 0/20 losing copies), versus
-hold-cash 0.00 SOL.
+drawdown 2.0%, guardrails met; its 20-copy stress median was −0.10 SOL
+with 11/20 copies losing), versus hold-cash 0.00 SOL.
+
+Local `grade-local` on this kit's dev window: **+0.371 SOL net**
+(102 round trips over 102 coins, 46% win rate, max drawdown 1.9%,
+guardrails met; 20-copy stress median −0.10 SOL, 12/20 copies losing —
+the dev score sits above 19 of 20 rebuilt copies, so the edge leans on
+this window's coins; L1 regrade reproduced byte for byte).
