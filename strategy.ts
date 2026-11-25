@@ -18,6 +18,10 @@
 // the bot still puts in the 20+ round trips the guardrail asks for.
 // Nothing here reads the clock, the environment or Math.random, so two
 // runs are byte-identical.
+//
+// Structure: onBatch runs five small passes in order — foldFills, foldEvents,
+// pruneTape, exitPass, entryPass — each owning one job, so the entry and
+// exit rules can be read (and tuned) without wading through bookkeeping.
 
 import type { Batch, BotState, OrderInput } from './vendor/agentfun-bot.ts';
 
@@ -93,6 +97,11 @@ function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
   return q - (q * FEE_BPS + BPS - 1n) / BPS;
 }
 
+/** Current price over the create price, in bps (10,000 = unchanged). */
+function runupBps(vq: bigint, vt: bigint, vq0: bigint, vt0: bigint): bigint {
+  return (vq * vt0 * BPS) / (vt * vq0);
+}
+
 /** One trade on the tape, kept only while it is inside the flow window. */
 interface TapeTrade {
   slot: number;
@@ -164,6 +173,13 @@ function freshBook(creator: string, slot: number): MintBook {
   };
 }
 
+/** Entry limits at the current relaxation level. */
+interface EntryLimits {
+  maxAge: number;
+  minRealSol: bigint;
+  minRecent: number;
+}
+
 export function createStrategy(params: SniperParams = DEFAULT_PARAMS) {
   const books = new Map<string, MintBook>();
   let coinsSeen = 0;
@@ -187,19 +203,14 @@ export function createStrategy(params: SniperParams = DEFAULT_PARAMS) {
     return out;
   }
 
-  /** Entry limits at the current relaxation level. */
-  function entryLimits(): { maxAge: number; minRealSol: bigint; minRecent: number } {
+  function entryLimits(): EntryLimits {
     if (relaxed === 1) return { maxAge: 6, minRealSol: 2_000_000_000n, minRecent: 4 };
     if (relaxed >= 2) return { maxAge: 10, minRealSol: 1_000_000_000n, minRecent: 3 };
     return { maxAge: params.maxAgeSlots, minRealSol: params.minRealSolLamports, minRecent: params.minRecentBuyers };
   }
 
-  function onBatch(state: BotState, batch: Batch): OrderInput[] {
-    const now = batch.slot;
-    const orders: OrderInput[] = [];
-    const txFee = state.txFeeLamports();
-
-    // ---- fold this batch's fills into the books -------------------------
+  /** Pass 1 — fold this batch's fills into the books. */
+  function foldFills(batch: Batch): void {
     for (const f of batch.fills) {
       const b = bookFor(f.mint);
       if (f.status !== 'rejected') b.txPaid += BigInt(f.tx_fee_lamports);
@@ -220,8 +231,10 @@ export function createStrategy(params: SniperParams = DEFAULT_PARAMS) {
       if (f.side === 'buy') b.buyPending = false;
       else b.sellPending = false;
     }
+  }
 
-    // ---- fold this batch's events into the tape -------------------------
+  /** Pass 2 — fold this batch's events into the tape. */
+  function foldEvents(batch: Batch): void {
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
         const b = bookFor(e.mint);
@@ -254,23 +267,28 @@ export function createStrategy(params: SniperParams = DEFAULT_PARAMS) {
         bookFor(e.mint).complete = true;
       }
     }
-    // Prune tape entries older than the flow window (tapes are short).
-    for (const b of books.values()) {
-      while (b.trades.length > 0 && b.trades[0].slot < now - params.flowWindowSlots - 2) b.trades.shift();
-    }
+  }
 
-    // ---- pace guard: relax the filter if qualified coins run scarce -----
+  /** Pass 3 — drop tape entries older than the flow window. */
+  function pruneTape(now: number): void {
+    const cutoff = now - params.flowWindowSlots - 2;
+    for (const b of books.values()) {
+      b.trades = b.trades.filter((t) => t.slot >= cutoff);
+    }
+  }
+
+  /** Pace guard: relax the filter if qualified coins run scarce. */
+  function relaxIfScarce(): void {
     // The strict filter trades about one in ten new coins on the dev
     // window; if we are far below that pace once enough coins have been
     // seen, loosen in stages so the 20-coin round-trip guardrail is still
     // met on a fresh window.
     if (coinsSeen >= 100 && coinsTraded < Math.floor(coinsSeen * 0.04) && relaxed < 1) relaxed = 1;
     if (coinsSeen >= 300 && coinsTraded < Math.floor(coinsSeen * 0.02) && relaxed < 2) relaxed = 2;
+  }
 
-    const limits = entryLimits();
-    const maxPositions = state.hello.caps.max_open_positions;
-
-    // ---- exits for coins we already hold --------------------------------
+  /** Pass 4 — exits for coins we already hold. */
+  function exitPass(state: BotState, now: number, txFee: bigint, orders: OrderInput[]): void {
     for (const [mint, b] of books) {
       if (b.tokens <= 0n || b.sellPending) continue;
       const curve = state.curves.get(mint);
@@ -294,39 +312,70 @@ export function createStrategy(params: SniperParams = DEFAULT_PARAMS) {
         b.sellPending = true;
       }
     }
+  }
 
-    // ---- entries: fresh coins with a strong tape and no rug signal ------
-    if (state.committedPositionCount() < maxPositions) {
-      for (const [mint, curve] of state.curves) {
-        if (orders.length >= state.hello.caps.max_orders_per_batch) break;
-        if (state.committedPositionCount() + orders.filter((o) => o.side === 'buy').length >= maxPositions) break;
-        const b = books.get(mint);
-        if (b === undefined || b.createdSlot < 0 || curve.complete) continue;
-        const age = now - b.createdSlot;
-        if (age < 0 || age > limits.maxAge) continue;
-        if (b.bought || b.tokens > 0n || b.buyPending) continue;
-        if (curve.real_quote_reserves < limits.minRealSol) continue;
-        if (curve.real_quote_reserves > params.maxRealSolLamports) continue;
-        if (b.devBuy > params.maxDevBuyLamports) continue;
-        if (b.buyers.size > params.maxBuyers) continue;
-        if (recentBuyers(b, now).size < limits.minRecent) continue;
-        if (params.skipDevSold && b.devSold) continue;
-        if (b.buySol > 0n && b.soldByOthers * BPS > b.buySol * BigInt(params.maxSellRatioBps)) continue;
-        if (b.bigSellBps > BigInt(params.maxBigSellBps)) continue;
-        // Price must still be above half its create price.
-        const runup = (curve.virtual_quote_reserves * b.vt0 * BPS) / (curve.virtual_token_reserves * b.vq0);
-        if (runup < BigInt(params.minRunupBps)) continue;
-        const room = state.maxBuyLamports(mint);
-        const amount = room < params.stakeLamports ? room : params.stakeLamports;
-        const free = state.freeCashLamports() - txFee;
-        if (amount < params.minBuyLamports || free < amount) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: params.slippageBps });
-        b.buyPending = true;
-        b.bought = true;
-        b.firstBuySlot = now;
-        coinsTraded += 1;
-      }
+  /** Every entry rejection, in the order the strict filter applies them. */
+  function entryRejectReason(
+    state: BotState,
+    mint: string,
+    b: MintBook,
+    limits: EntryLimits,
+    now: number,
+  ): string | null {
+    const curve = state.curves.get(mint)!;
+    const age = now - b.createdSlot;
+    if (age < 0 || age > limits.maxAge) return 'too-old';
+    if (b.bought || b.tokens > 0n || b.buyPending) return 'already-in';
+    if (curve.real_quote_reserves < limits.minRealSol) return 'reserve-too-small';
+    if (curve.real_quote_reserves > params.maxRealSolLamports) return 'reserve-too-large';
+    if (b.devBuy > params.maxDevBuyLamports) return 'dev-bought-too-much';
+    if (b.buyers.size > params.maxBuyers) return 'too-many-buyers';
+    if (recentBuyers(b, now).size < limits.minRecent) return 'tape-too-thin';
+    if (params.skipDevSold && b.devSold) return 'dev-sold';
+    if (b.buySol > 0n && b.soldByOthers * BPS > b.buySol * BigInt(params.maxSellRatioBps)) return 'too-much-selling';
+    if (b.bigSellBps > BigInt(params.maxBigSellBps)) return 'big-sell';
+    // Price must still be above half its create price.
+    if (runupBps(curve.virtual_quote_reserves, curve.virtual_token_reserves, b.vq0, b.vt0) < BigInt(params.minRunupBps)) {
+      return 'no-runup';
     }
+    return null;
+  }
+
+  /** Pass 5 — entries: fresh coins with a strong tape and no rug signal. */
+  function entryPass(state: BotState, now: number, txFee: bigint, limits: EntryLimits, orders: OrderInput[]): void {
+    const maxPositions = state.hello.caps.max_open_positions;
+    if (state.committedPositionCount() >= maxPositions) return;
+    for (const [mint, curve] of state.curves) {
+      if (orders.length >= state.hello.caps.max_orders_per_batch) break;
+      if (state.committedPositionCount() + orders.filter((o) => o.side === 'buy').length >= maxPositions) break;
+      const b = books.get(mint);
+      if (b === undefined || b.createdSlot < 0 || curve.complete) continue;
+      if (entryRejectReason(state, mint, b, limits, now) !== null) continue;
+      const room = state.maxBuyLamports(mint);
+      const amount = room < params.stakeLamports ? room : params.stakeLamports;
+      const free = state.freeCashLamports() - txFee;
+      if (amount < params.minBuyLamports || free < amount) continue;
+      orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: params.slippageBps });
+      b.buyPending = true;
+      b.bought = true;
+      b.firstBuySlot = now;
+      coinsTraded += 1;
+    }
+  }
+
+  function onBatch(state: BotState, batch: Batch): OrderInput[] {
+    const now = batch.slot;
+    const orders: OrderInput[] = [];
+    const txFee = state.txFeeLamports();
+
+    foldFills(batch);
+    foldEvents(batch);
+    pruneTape(now);
+    relaxIfScarce();
+
+    const limits = entryLimits();
+    exitPass(state, now, txFee, orders);
+    entryPass(state, now, txFee, limits, orders);
 
     return orders;
   }
